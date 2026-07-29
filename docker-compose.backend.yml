@@ -50,7 +50,7 @@ services:
       DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL}
       REDIS_URL: ${REDIS_URL:?set REDIS_URL}
     ports:
-      - "${KEYGEN_PORT:-3000}:3000"
+      - "127.0.0.1:${KEYGEN_PORT:-3000}:3000"
     networks:
       - internal
     command: ["bundle", "exec", "puma", "-C", "config/puma.rb"]
@@ -105,7 +105,7 @@ services:
       CHAPA_PUBLIC_KEY: ${CHAPA_PUBLIC_KEY:-}
       CHAPA_ENCRYPTION_KEY: ${CHAPA_ENCRYPTION_KEY:-}
     ports:
-      - "${MIDDLEWARE_PORT:-8000}:8000"
+      - "127.0.0.1:${MIDDLEWARE_PORT:-8000}:8000"
     networks:
       - internal
     healthcheck:

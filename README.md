@@ -8,32 +8,57 @@ WooCommerce production site:
 https://merebhub.com
 ```
 
-Recommended public middleware URL:
+Public middleware URL:
 
 ```text
 https://license-api.merebhub.com
 ```
 
+## Recommended deploy target
+
+Use a VPS with Docker Compose. If the VPS already runs VitoDeploy, keep VitoDeploy handling ports `80`/`443` and proxy `license-api.merebhub.com` to:
+
+```text
+http://127.0.0.1:8000
+```
+
+Start here:
+
+```text
+VPS-DEPLOYMENT.md
+```
+
 ## Contents
 
-- `render.yaml` — Render Blueprint for Keygen API, Keygen worker, FastAPI middleware, managed Postgres, and managed Key Value/Redis.
-- `docker-compose.backend.yml` — backend-only Docker Compose stack for VPS/Docker hosting.
-- `.env.production.example` — placeholder-only environment template. Copy to `.env.production` and fill real values for non-Render Docker deploys.
+- `docker-compose.backend.yml` — backend-only VPS Docker Compose stack.
+- `.env.production.example` — placeholder-only VPS env template. Copy to `.env.production` on the VPS.
 - `Dockerfile.keygen` — Keygen CE image customization.
+- `Dockerfile` — default middleware Dockerfile for simple hosts.
 - `middleware/` — FastAPI middleware source and Dockerfile.
-- `DEPLOYMENT.md` — deployment checklist and commands.
+- `DEPLOYMENT.md` — short deployment overview.
+- `VPS-DEPLOYMENT.md` — full VPS + VitoDeploy instructions.
+- `render.yaml` — legacy/optional Render Blueprint, not the current recommended path.
 
 ## Not included
 
 - Real secrets or `.env.production`.
 - Local WordPress/MariaDB/certbot Docker services.
 - Local `.config/*.env` files.
-- WordPress plugin files. Upload/update those separately on `merebhub.com`.
+- WordPress plugin files.
 
-## Render quick start
+## VPS quick start
 
-1. Create a Render Blueprint from `render.yaml`.
-2. Fill every `sync: false` value in Render.
-3. Use `https://merebhub.com` for `WOOCOMMERCE_URL`.
-4. Point the hosted WooCommerce plugin middleware URL to your public middleware URL.
-5. Check `/health` before rebuilding the desktop app.
+```bash
+cd /opt/merebhub
+git clone https://github.com/zubeir493/merebhub-licensing-backend.git
+cd merebhub-licensing-backend
+cp .env.production.example .env.production
+nano .env.production
+docker compose -p merebhub-licensing -f docker-compose.backend.yml --env-file .env.production up -d --build
+```
+
+Then proxy:
+
+```text
+license-api.merebhub.com -> http://127.0.0.1:8000
+```
