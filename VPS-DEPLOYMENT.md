@@ -230,6 +230,12 @@ Proxy target:
 http://127.0.0.1:8000
 ```
 
+Shortcut:
+
+```text
+license-api.merebhub.com -> http://127.0.0.1:8000
+```
+
 Enable SSL certificate for:
 
 ```text
