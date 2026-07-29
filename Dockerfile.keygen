@@ -1,0 +1,7 @@
+FROM keygen/api:latest
+
+# Add force_ssl=false BEFORE the closing end of the configure block.
+# TLS is terminated by the hosting platform/proxy; Rails still serves HTTP inside the container.
+RUN sed -i '/^  config\.active_record\.dump_schema_after_migration = false/a\  config.force_ssl = false' /app/config/environments/production.rb
+
+EXPOSE 3000

@@ -1,0 +1,124 @@
+services:
+  keygen-db:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  keygen-redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: sh -c 'redis-server --appendonly yes --requirepass "$${REDIS_PASSWORD}"'
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD}
+    volumes:
+      - redis_data:/data
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli --pass \"$${REDIS_PASSWORD}\" ping | grep PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  keygen-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.keygen
+    restart: unless-stopped
+    depends_on:
+      keygen-db:
+        condition: service_healthy
+      keygen-redis:
+        condition: service_healthy
+    env_file:
+      - ${PRODUCTION_ENV_FILE:-.env.production}
+    environment:
+      KEYGEN_HOSTS: ${KEYGEN_HOSTS:?set KEYGEN_HOSTS}
+      KEYGEN_ADMIN_TOKEN: ${KEYGEN_ADMIN_TOKEN:?set KEYGEN_ADMIN_TOKEN}
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL}
+      REDIS_URL: ${REDIS_URL:?set REDIS_URL}
+    ports:
+      - "${KEYGEN_PORT:-3000}:3000"
+    networks:
+      - internal
+    command: ["bundle", "exec", "puma", "-C", "config/puma.rb"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:3000/v1/health >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  keygen-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.keygen
+    restart: unless-stopped
+    depends_on:
+      keygen-db:
+        condition: service_healthy
+      keygen-redis:
+        condition: service_healthy
+    env_file:
+      - ${PRODUCTION_ENV_FILE:-.env.production}
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL}
+      REDIS_URL: ${REDIS_URL:?set REDIS_URL}
+    networks:
+      - internal
+    command: ["bundle", "exec", "sidekiq", "-C", "config/sidekiq.yml"]
+
+  middleware-api:
+    build:
+      context: ./middleware
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      keygen-api:
+        condition: service_healthy
+      keygen-redis:
+        condition: service_healthy
+    env_file:
+      - ${PRODUCTION_ENV_FILE:-.env.production}
+    environment:
+      REDIS_URL: ${REDIS_URL:?set REDIS_URL}
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL}
+      KEYGEN_ACCOUNT_ID: ${KEYGEN_ACCOUNT_ID:?set KEYGEN_ACCOUNT_ID}
+      KEYGEN_API_URL: ${KEYGEN_API_URL:?set KEYGEN_API_URL}
+      KEYGEN_ADMIN_TOKEN: ${KEYGEN_ADMIN_TOKEN:?set KEYGEN_ADMIN_TOKEN}
+      WOOCOMMERCE_URL: ${WOOCOMMERCE_URL:?set WOOCOMMERCE_URL}
+      WOOCOMMERCE_CONSUMER_KEY: ${WOOCOMMERCE_CONSUMER_KEY:?set WOOCOMMERCE_CONSUMER_KEY}
+      WOOCOMMERCE_CONSUMER_SECRET: ${WOOCOMMERCE_CONSUMER_SECRET:?set WOOCOMMERCE_CONSUMER_SECRET}
+      CHAPA_SECRET_KEY: ${CHAPA_SECRET_KEY:-}
+      CHAPA_PUBLIC_KEY: ${CHAPA_PUBLIC_KEY:-}
+      CHAPA_ENCRYPTION_KEY: ${CHAPA_ENCRYPTION_KEY:-}
+    ports:
+      - "${MIDDLEWARE_PORT:-8000}:8000"
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/health >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+networks:
+  internal:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
