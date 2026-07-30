@@ -46,6 +46,7 @@ services:
       - ${PRODUCTION_ENV_FILE:-.env.production}
     environment:
       KEYGEN_HOSTS: ${KEYGEN_HOSTS:?set KEYGEN_HOSTS}
+      KEYGEN_DOMAIN: ${KEYGEN_DOMAIN:-keygen-api}
       KEYGEN_ADMIN_TOKEN: ${KEYGEN_ADMIN_TOKEN:?set KEYGEN_ADMIN_TOKEN}
       DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL}
       REDIS_URL: ${REDIS_URL:?set REDIS_URL}
@@ -55,7 +56,7 @@ services:
       - internal
     command: ["bundle", "exec", "puma", "-C", "config/puma.rb"]
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost:3000/v1/health >/dev/null || exit 1"]
+      test: ["CMD-SHELL", "ruby -rnet/http -ruri -e 'res=Net::HTTP.get_response(URI(\"http://127.0.0.1:3000/v1/health\")); exit(res.code.to_i < 500 ? 0 : 1)'"]
       interval: 30s
       timeout: 10s
       retries: 5
@@ -75,6 +76,7 @@ services:
       - ${PRODUCTION_ENV_FILE:-.env.production}
     environment:
       DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL}
+      KEYGEN_DOMAIN: ${KEYGEN_DOMAIN:-keygen-api}
       REDIS_URL: ${REDIS_URL:?set REDIS_URL}
     networks:
       - internal
@@ -109,7 +111,7 @@ services:
     networks:
       - internal
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/health >/dev/null || exit 1"]
+      test: ["CMD-SHELL", "python -c 'import urllib.request; urllib.request.urlopen(\"http://127.0.0.1:8000/health\", timeout=5)'"]
       interval: 30s
       timeout: 10s
       retries: 5
