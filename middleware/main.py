@@ -38,6 +38,14 @@ from desktop_license_contracts import (
     verify_admin_bearer_token,
 )
 
+from keygen_admin import (
+    insert_dynamic,
+    json_metadata,
+    normalize_keygen_row,
+    safe_slug,
+    update_dynamic,
+)
+
 from qr_short_codes import (
     ActivationRequestError,
     build_short_code_payload,
@@ -159,6 +167,11 @@ def require_offline_file_admin(request: Request) -> None:
         request.headers.get("x-merebhub-admin-token", ""),
     ):
         raise HTTPException(status_code=401, detail="Invalid or missing offline license file admin token")
+
+
+def require_keygen_admin(request: Request) -> None:
+    """Protect Keygen dashboard endpoints used by the WordPress admin plugin."""
+    require_offline_file_admin(request)
 
 
 def wants_json_response(request: Request, explicit_format: Optional[str] = None) -> bool:
@@ -995,6 +1008,254 @@ async def validate_offline_endpoint(request: Request):
     public_key = body.get("public_key", "")
     result = await validate_offline_lic(lic_content=lic_content, public_key=public_key)
     return JSONResponse(content=result, status_code=200)
+
+
+# ---------------------------------------------------------------------------
+# KEYGEN ADMIN DASHBOARD ENDPOINTS
+# ---------------------------------------------------------------------------
+
+async def _admin_db_connect():
+    import asyncpg
+
+    db_url = os.getenv("DATABASE_URL", "")
+    if not db_url:
+        raise HTTPException(status_code=503, detail="Licensing database is not configured")
+    return await asyncpg.connect(db_url)
+
+
+@app.get("/v1/admin/summary")
+async def admin_summary_endpoint(request: Request):
+    require_keygen_admin(request)
+    conn = await _admin_db_connect()
+    try:
+        products = await conn.fetchval("SELECT COUNT(*) FROM products WHERE account_id = $1", KEYGEN_ACCOUNT_ID)
+        policies = await conn.fetchval("SELECT COUNT(*) FROM policies WHERE account_id = $1", KEYGEN_ACCOUNT_ID)
+        licenses = await conn.fetchval("SELECT COUNT(*) FROM licenses WHERE account_id = $1", KEYGEN_ACCOUNT_ID)
+        machines = await conn.fetchval("SELECT COUNT(*) FROM machines WHERE account_id = $1", KEYGEN_ACCOUNT_ID)
+        return JSONResponse(content={
+            "products": int(products or 0),
+            "policies": int(policies or 0),
+            "licenses": int(licenses or 0),
+            "machines": int(machines or 0),
+        })
+    finally:
+        await conn.close()
+
+
+@app.get("/v1/admin/products")
+async def admin_list_products_endpoint(request: Request):
+    require_keygen_admin(request)
+    conn = await _admin_db_connect()
+    try:
+        rows = await conn.fetch(
+            """
+            SELECT p.id, p.name, p.code, p.url, p.metadata, p.created_at, p.updated_at,
+                   (SELECT COUNT(*) FROM policies po WHERE po.product_id = p.id) AS policies_count,
+                   (SELECT COUNT(*) FROM licenses l WHERE l.product_id = p.id) AS licenses_count
+              FROM products p
+             WHERE p.account_id = $1
+             ORDER BY p.created_at DESC
+            """,
+            KEYGEN_ACCOUNT_ID,
+        )
+        return JSONResponse(content={"products": [normalize_keygen_row(row) for row in rows]})
+    finally:
+        await conn.close()
+
+
+@app.post("/v1/admin/products")
+async def admin_create_product_endpoint(request: Request):
+    require_keygen_admin(request)
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    name = str(body.get("name") or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Missing product name")
+
+    product_id = str(uuid.uuid4())
+    conn = await _admin_db_connect()
+    try:
+        product = await insert_dynamic(
+            conn,
+            "products",
+            ["id", "account_id", "name", "code", "url", "metadata", "created_at", "updated_at"],
+            {
+                "id": uuid.UUID(product_id),
+                "account_id": uuid.UUID(KEYGEN_ACCOUNT_ID),
+                "name": name,
+                "code": str(body.get("code") or safe_slug(name)),
+                "url": str(body.get("url") or ""),
+                "metadata": json_metadata(body.get("metadata", {})),
+                "created_at": datetime.utcnow(),
+                "updated_at": datetime.utcnow(),
+            },
+        )
+        return JSONResponse(content={"status": "created", "product": product}, status_code=201)
+    finally:
+        await conn.close()
+
+
+@app.patch("/v1/admin/products/{product_id}")
+async def admin_update_product_endpoint(product_id: str, request: Request):
+    require_keygen_admin(request)
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    values = {}
+    for key in ("name", "code", "url"):
+        if key in body:
+            values[key] = str(body.get(key) or "").strip()
+    if "metadata" in body:
+        values["metadata"] = json_metadata(body.get("metadata"))
+    conn = await _admin_db_connect()
+    try:
+        product = await update_dynamic(conn, "products", product_id, KEYGEN_ACCOUNT_ID, values)
+        if not product:
+            raise HTTPException(status_code=404, detail="Product not found")
+        return JSONResponse(content={"status": "updated", "product": product})
+    finally:
+        await conn.close()
+
+
+@app.delete("/v1/admin/products/{product_id}")
+async def admin_delete_product_endpoint(product_id: str, request: Request, force: bool = False):
+    require_keygen_admin(request)
+    conn = await _admin_db_connect()
+    try:
+        product_uuid = uuid.UUID(product_id)
+        license_count = await conn.fetchval("SELECT COUNT(*) FROM licenses WHERE account_id = $1 AND product_id = $2", KEYGEN_ACCOUNT_ID, product_uuid)
+        policy_count = await conn.fetchval("SELECT COUNT(*) FROM policies WHERE account_id = $1 AND product_id = $2", KEYGEN_ACCOUNT_ID, product_uuid)
+        if int(license_count or 0) > 0:
+            raise HTTPException(status_code=409, detail="Product has licenses and cannot be deleted")
+        if int(policy_count or 0) > 0 and not force:
+            raise HTTPException(status_code=409, detail="Product has policies; pass force=true to delete policies too")
+        if force:
+            await conn.execute("DELETE FROM policies WHERE account_id = $1 AND product_id = $2", KEYGEN_ACCOUNT_ID, product_uuid)
+        result = await conn.execute("DELETE FROM products WHERE account_id = $1 AND id = $2", KEYGEN_ACCOUNT_ID, product_uuid)
+        return JSONResponse(content={"status": "deleted", "result": result})
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid product id") from exc
+    finally:
+        await conn.close()
+
+
+@app.get("/v1/admin/policies")
+async def admin_list_policies_endpoint(request: Request, product_id: str = ""):
+    require_keygen_admin(request)
+    conn = await _admin_db_connect()
+    try:
+        if product_id:
+            rows = await conn.fetch(
+                "SELECT id, product_id, name, max_machines, max_processes, duration, metadata, created_at, updated_at FROM policies WHERE account_id = $1 AND product_id = $2 ORDER BY created_at DESC",
+                KEYGEN_ACCOUNT_ID,
+                uuid.UUID(product_id),
+            )
+        else:
+            rows = await conn.fetch(
+                "SELECT id, product_id, name, max_machines, max_processes, duration, metadata, created_at, updated_at FROM policies WHERE account_id = $1 ORDER BY created_at DESC",
+                KEYGEN_ACCOUNT_ID,
+            )
+        return JSONResponse(content={"policies": [normalize_keygen_row(row) for row in rows]})
+    finally:
+        await conn.close()
+
+
+@app.get("/v1/admin/licenses")
+async def admin_list_licenses_endpoint(request: Request, product_id: str = "", policy_id: str = "", limit: int = 50):
+    require_keygen_admin(request)
+    filters = ["l.account_id = $1"]
+    args = [KEYGEN_ACCOUNT_ID]
+    if product_id:
+        args.append(uuid.UUID(product_id))
+        filters.append(f"l.product_id = ${len(args)}")
+    if policy_id:
+        args.append(uuid.UUID(policy_id))
+        filters.append(f"l.policy_id = ${len(args)}")
+    args.append(max(1, min(int(limit), 200)))
+    conn = await _admin_db_connect()
+    try:
+        rows = await conn.fetch(
+            f"""
+            SELECT l.id, l.key, l.name, l.email, l.product_id, l.policy_id, l.expiry, l.suspended,
+                   COALESCE(l.machines_count, 0) AS machines_count,
+                   COALESCE(l.max_machines_override, p.max_machines, 1) AS machines_limit,
+                   l.created_at, l.updated_at
+              FROM licenses l
+              LEFT JOIN policies p ON p.id = l.policy_id
+             WHERE {' AND '.join(filters)}
+             ORDER BY l.created_at DESC
+             LIMIT ${len(args)}
+            """,
+            *args,
+        )
+        return JSONResponse(content={"licenses": [normalize_keygen_row(row) for row in rows]})
+    finally:
+        await conn.close()
+
+
+@app.post("/v1/admin/licenses")
+async def admin_create_license_endpoint(request: Request):
+    require_keygen_admin(request)
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    email = str(body.get("email") or "").strip()
+    policy_id = str(body.get("policy_id") or "").strip()
+    if not email or not policy_id:
+        raise HTTPException(status_code=400, detail="Missing email or policy_id")
+    license_data = await provision_license_direct(
+        email=email,
+        product_name=str(body.get("product_name") or "Manual License"),
+        policy_id=policy_id,
+        max_machines=int(body.get("max_machines") or 3),
+        max_processes=int(body.get("max_processes") or 5),
+        licensing_type=str(body.get("licensing_type") or "perpetual"),
+    )
+    return JSONResponse(content={"status": "created", "license": license_data}, status_code=201)
+
+
+@app.patch("/v1/admin/licenses/{license_id}")
+async def admin_update_license_endpoint(license_id: str, request: Request):
+    require_keygen_admin(request)
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    values = {}
+    for key in ("email", "name"):
+        if key in body:
+            values[key] = str(body.get(key) or "").strip()
+    if "suspended" in body:
+        values["suspended"] = bool(body.get("suspended"))
+    if "max_machines" in body:
+        values["max_machines_override"] = max(1, int(body.get("max_machines") or 1))
+    conn = await _admin_db_connect()
+    try:
+        license_row = await update_dynamic(conn, "licenses", license_id, KEYGEN_ACCOUNT_ID, values)
+        if not license_row:
+            raise HTTPException(status_code=404, detail="License not found")
+        return JSONResponse(content={"status": "updated", "license": license_row})
+    finally:
+        await conn.close()
+
+
+@app.delete("/v1/admin/licenses/{license_id}")
+async def admin_delete_license_endpoint(license_id: str, request: Request):
+    require_keygen_admin(request)
+    conn = await _admin_db_connect()
+    try:
+        license_uuid = uuid.UUID(license_id)
+        await conn.execute("DELETE FROM machines WHERE account_id = $1 AND license_id = $2", KEYGEN_ACCOUNT_ID, license_uuid)
+        result = await conn.execute("DELETE FROM licenses WHERE account_id = $1 AND id = $2", KEYGEN_ACCOUNT_ID, license_uuid)
+        return JSONResponse(content={"status": "deleted", "result": result})
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid license id") from exc
+    finally:
+        await conn.close()
 
 
 # ---------------------------------------------------------------------------
