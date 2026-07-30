@@ -28,11 +28,20 @@ from typing import Optional
 import httpx
 import redis.asyncio as aioredis
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
+
+from desktop_license_contracts import (
+    build_desktop_license_file,
+    build_desktop_license_filename,
+    enforce_license_scope,
+    extract_desktop_request_token,
+    verify_admin_bearer_token,
+)
 
 from qr_short_codes import (
     ActivationRequestError,
     build_short_code_payload,
+    create_response_token,
     parse_activation_request,
     render_short_code_html,
 )
@@ -75,6 +84,7 @@ WOOCOMMERCE_CONSUMER_KEY: str = os.getenv("WOOCOMMERCE_CONSUMER_KEY", "")
 WOOCOMMERCE_CONSUMER_SECRET: str = os.getenv("WOOCOMMERCE_CONSUMER_SECRET", "")
 CHAPA_SECRET_KEY: str = os.getenv("CHAPA_SECRET_KEY", "")
 QR_OFFLINE_SIGNATURE_KEY_HEX: str = os.getenv("QR_OFFLINE_SIGNATURE_KEY_HEX", "")
+OFFLINE_LICENSE_FILE_TOKEN: str = os.getenv("OFFLINE_LICENSE_FILE_TOKEN", "")
 
 # Verify critical configuration at startup
 def redact_connection_url(url: str) -> str:
@@ -137,6 +147,18 @@ def get_qr_offline_signing_key() -> bytes:
     if len(key) < 16:
         raise HTTPException(status_code=503, detail="QR offline signing key is too short")
     return key
+
+
+def require_offline_file_admin(request: Request) -> None:
+    """Protect .lreq -> .lic conversion; this endpoint is for admins/support."""
+    if not OFFLINE_LICENSE_FILE_TOKEN.strip():
+        raise HTTPException(status_code=503, detail="Offline license file admin token is not configured")
+    if not verify_admin_bearer_token(
+        OFFLINE_LICENSE_FILE_TOKEN,
+        request.headers.get("authorization", ""),
+        request.headers.get("x-merebhub-admin-token", ""),
+    ):
+        raise HTTPException(status_code=401, detail="Invalid or missing offline license file admin token")
 
 
 def wants_json_response(request: Request, explicit_format: Optional[str] = None) -> bool:
@@ -549,7 +571,7 @@ async def _activate_desktop_license(body: dict, register: bool = True) -> dict:
     try:
         row = await conn.fetchrow(
             """
-            SELECT l.id, l.account_id, l.policy_id, l.expiry, l.suspended,
+            SELECT l.id, l.account_id, l.product_id, l.policy_id, l.expiry, l.suspended,
                    COALESCE(l.max_machines_override, p.max_machines, 1) AS max_machines,
                    p.name AS policy_name
               FROM licenses l
@@ -562,6 +584,9 @@ async def _activate_desktop_license(body: dict, register: bool = True) -> dict:
         )
         if not row:
             return {"status": "invalid", "code": "NOT_FOUND", "message": "That license key was not found."}
+        scope_error = enforce_license_scope(row, body)
+        if scope_error:
+            return scope_error
         if row["suspended"]:
             return {"status": "invalid", "code": "SUSPENDED", "message": "This license is suspended."}
         if row["expiry"] and row["expiry"].replace(tzinfo=timezone.utc) <= datetime.now(timezone.utc):
@@ -751,6 +776,8 @@ async def offline_short_code_page(request: Request, request_token: str = "", for
             "license_key": fields.get("key", ""),
             "fingerprint": fields.get("fp", ""),
             "product": fields.get("prod", "Windows Demo App"),
+            "product_id": fields.get("pid", ""),
+            "policy": fields.get("policy", ""),
             "hostname": f"qr-device-{fields.get('fp', '')[:8]}",
         },
         register=True,
@@ -788,6 +815,91 @@ async def offline_short_code_api(request: Request):
         raise HTTPException(status_code=400, detail="Invalid JSON")
     token = (body.get("request") or body.get("request_token") or "").strip()
     return await offline_short_code_page(request, request_token=token, format="json")
+
+
+@app.post("/v1/offline/license-files")
+async def offline_license_file_api(request: Request):
+    """
+    Admin/support endpoint: convert a desktop .lreq/MRBREQ1 request into a
+    desktop-compatible .lic file containing an MRB1 signed activation token.
+
+    Authentication: Authorization: Bearer $OFFLINE_LICENSE_FILE_TOKEN or
+    X-MerebHub-Admin-Token: $OFFLINE_LICENSE_FILE_TOKEN.
+    """
+    require_offline_file_admin(request)
+
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    raw = body.get("request") or body.get("request_token") or body.get("request_file_contents") or body.get("lreq_content") or ""
+    request_token = extract_desktop_request_token(str(raw))
+    if not request_token:
+        raise HTTPException(status_code=400, detail="No MRBREQ1 activation request was found")
+
+    try:
+        fields = parse_activation_request(request_token)
+    except ActivationRequestError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    activation = await _activate_desktop_license(
+        {
+            "license_key": fields.get("key", ""),
+            "fingerprint": fields.get("fp", ""),
+            "product": fields.get("prod", "Windows Demo App"),
+            "product_id": fields.get("pid", ""),
+            "policy": fields.get("policy", ""),
+            "hostname": f"offline-file-device-{fields.get('fp', '')[:8]}",
+        },
+        register=True,
+    )
+
+    if activation.get("status") != "activated":
+        status_code = 409 if activation.get("status") == "machine_limit" else 400
+        return JSONResponse(content=activation, status_code=status_code)
+
+    signing_key = get_qr_offline_signing_key()
+    response_token = create_response_token(
+        fields,
+        signing_key,
+        expires_at=activation.get("expires_at"),
+        seats=int(activation.get("machines_limit") or 0),
+    )
+    lic_content = build_desktop_license_file(
+        response_token=response_token,
+        product=fields.get("prod", "Windows Demo App"),
+        fingerprint=fields.get("fp", ""),
+        license_id=activation.get("license_id", ""),
+        machines_count=int(activation.get("machines_count") or 0),
+        machines_limit=int(activation.get("machines_limit") or 0),
+        expires_at=activation.get("expires_at"),
+    )
+    filename = build_desktop_license_filename(fields.get("prod", "MerebHub-License"), fields.get("fp", ""))
+
+    if (body.get("format") or "").lower() in {"file", "download", "text"}:
+        return Response(
+            content=lic_content,
+            media_type="text/plain; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    return JSONResponse(
+        content={
+            "status": "activated",
+            "filename": filename,
+            "lic_content": lic_content,
+            "response_token": response_token,
+            "license_id": activation.get("license_id", ""),
+            "fingerprint": fields.get("fp", ""),
+            "product": fields.get("prod", "Windows Demo App"),
+            "machines_count": int(activation.get("machines_count") or 0),
+            "machines_limit": int(activation.get("machines_limit") or 0),
+            "expires_at": activation.get("expires_at"),
+            "message": "Save lic_content as the filename shown, then import it in the desktop app.",
+        },
+        status_code=200,
+    )
 
 
 @app.get("/activate")
