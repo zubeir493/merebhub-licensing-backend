@@ -12,7 +12,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # ── Application code ───────────────────────────────────────────────────────
-COPY main.py worker.py licensing.py releases.py ./
+COPY main.py worker.py licensing.py releases.py qr_short_codes.py ./
 
 # ── Run the FastAPI server ─────────────────────────────────────────────────
 # Render injects PORT; local Docker falls back to 8000.

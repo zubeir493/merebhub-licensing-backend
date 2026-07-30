@@ -28,7 +28,14 @@ from typing import Optional
 import httpx
 import redis.asyncio as aioredis
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
+
+from qr_short_codes import (
+    ActivationRequestError,
+    build_short_code_payload,
+    parse_activation_request,
+    render_short_code_html,
+)
 
 from licensing import (
     provision_license_direct,
@@ -67,6 +74,7 @@ WOOCOMMERCE_URL: str = os.getenv("WOOCOMMERCE_URL", "https://merebhub.com")
 WOOCOMMERCE_CONSUMER_KEY: str = os.getenv("WOOCOMMERCE_CONSUMER_KEY", "")
 WOOCOMMERCE_CONSUMER_SECRET: str = os.getenv("WOOCOMMERCE_CONSUMER_SECRET", "")
 CHAPA_SECRET_KEY: str = os.getenv("CHAPA_SECRET_KEY", "")
+QR_OFFLINE_SIGNATURE_KEY_HEX: str = os.getenv("QR_OFFLINE_SIGNATURE_KEY_HEX", "")
 
 # Verify critical configuration at startup
 def redact_connection_url(url: str) -> str:
@@ -116,6 +124,27 @@ def generate_license_key() -> str:
     raw = uuid.uuid4().hex.upper() + uuid.uuid4().hex.upper()
     segments = [raw[i:i + 6] for i in range(0, 30, 6)]
     return "-".join(segments)
+
+def get_qr_offline_signing_key() -> bytes:
+    """Return the HMAC key shared with desktop offline/QR activation builds."""
+    value = QR_OFFLINE_SIGNATURE_KEY_HEX.strip()
+    if not value or value.startswith("replace-with-"):
+        raise HTTPException(status_code=503, detail="QR offline signing key is not configured")
+    try:
+        key = bytes.fromhex(value)
+    except ValueError as exc:
+        raise HTTPException(status_code=503, detail="QR offline signing key is not valid hex") from exc
+    if len(key) < 16:
+        raise HTTPException(status_code=503, detail="QR offline signing key is too short")
+    return key
+
+
+def wants_json_response(request: Request, explicit_format: Optional[str] = None) -> bool:
+    """Prefer HTML for QR phone scans, JSON for API callers/tests."""
+    if explicit_format and explicit_format.lower() == "json":
+        return True
+    accept = request.headers.get("accept", "")
+    return "application/json" in accept and "text/html" not in accept
 
 
 def verify_chapa_signature(payload: bytes, signature_header: Optional[str]) -> bool:
@@ -694,6 +723,72 @@ async def desktop_license_machine_counts(license_id: str):
 
 
 # ── Protocol 2: QR Code Bridge Activation ─────────────────────────────────
+
+@app.get("/offline")
+async def offline_short_code_page(request: Request, request_token: str = "", format: Optional[str] = None):
+    """
+    Phone-scanned QR endpoint for an offline desktop activation request.
+
+    The desktop encodes an MRBREQ1 request in the QR code. A phone with
+    internet reaches this endpoint, the server validates/registers the license
+    for that exact device fingerprint, then returns a short code plus a
+    compatibility MRB1 response token bound to the same request nonce.
+    """
+    raw_request = request_token or request.query_params.get("request", "")
+    try:
+        fields = parse_activation_request(raw_request)
+    except ActivationRequestError as exc:
+        detail = {"status": "invalid", "code": "BAD_REQUEST_TOKEN", "message": str(exc)}
+        if wants_json_response(request, format):
+            return JSONResponse(content=detail, status_code=400)
+        return HTMLResponse(
+            content=f"<h1>Invalid activation request</h1><p>{detail['message']}</p>",
+            status_code=400,
+        )
+
+    activation = await _activate_desktop_license(
+        {
+            "license_key": fields.get("key", ""),
+            "fingerprint": fields.get("fp", ""),
+            "product": fields.get("prod", "Windows Demo App"),
+            "hostname": f"qr-device-{fields.get('fp', '')[:8]}",
+        },
+        register=True,
+    )
+
+    if activation.get("status") != "activated":
+        status_code = 409 if activation.get("status") == "machine_limit" else 400
+        if wants_json_response(request, format):
+            return JSONResponse(content=activation, status_code=status_code)
+        return HTMLResponse(
+            content=f"<h1>Activation failed</h1><p>{activation.get('message', 'The license could not be activated.')}</p>",
+            status_code=status_code,
+        )
+
+    payload = build_short_code_payload(
+        fields,
+        get_qr_offline_signing_key(),
+        license_id=activation.get("license_id", ""),
+        machines_count=int(activation.get("machines_count") or 0),
+        machines_limit=int(activation.get("machines_limit") or 0),
+        expires_at=activation.get("expires_at"),
+    )
+
+    if wants_json_response(request, format):
+        return JSONResponse(content=payload, status_code=200)
+    return HTMLResponse(content=render_short_code_html(payload), status_code=200)
+
+
+@app.post("/v1/offline/short-codes")
+async def offline_short_code_api(request: Request):
+    """JSON API variant of /offline for tests and non-browser QR clients."""
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    token = (body.get("request") or body.get("request_token") or "").strip()
+    return await offline_short_code_page(request, request_token=token, format="json")
+
 
 @app.get("/activate")
 async def qr_activation_page(key: str, fingerprint: str = ""):
