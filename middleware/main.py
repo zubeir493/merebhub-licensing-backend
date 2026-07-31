@@ -1163,6 +1163,98 @@ async def admin_list_policies_endpoint(request: Request, product_id: str = ""):
         await conn.close()
 
 
+@app.post("/v1/admin/policies")
+async def admin_create_policy_endpoint(request: Request):
+    require_keygen_admin(request)
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    name = str(body.get("name") or "").strip()
+    product_id = str(body.get("product_id") or "").strip()
+    if not name or not product_id:
+        raise HTTPException(status_code=400, detail="Missing policy name or product_id")
+    conn = await _admin_db_connect()
+    try:
+        product_uuid = uuid.UUID(product_id)
+        product_exists = await conn.fetchval("SELECT COUNT(*) FROM products WHERE account_id = $1 AND id = $2", KEYGEN_ACCOUNT_ID, product_uuid)
+        if int(product_exists or 0) < 1:
+            raise HTTPException(status_code=404, detail="Product not found")
+        policy = await insert_dynamic(
+            conn,
+            "policies",
+            [
+                "id", "account_id", "product_id", "name", "duration", "max_machines",
+                "max_processes", "max_cores", "scheme", "strict", "metadata", "created_at", "updated_at",
+            ],
+            {
+                "id": uuid.UUID(str(uuid.uuid4())),
+                "account_id": uuid.UUID(KEYGEN_ACCOUNT_ID),
+                "product_id": product_uuid,
+                "name": name,
+                "duration": int(body.get("duration") or 0),
+                "max_machines": max(1, int(body.get("max_machines") or 1)),
+                "max_processes": max(1, int(body.get("max_processes") or 1)),
+                "max_cores": int(body.get("max_cores") or 0) or None,
+                "scheme": str(body.get("scheme") or "ED25519_SIGN"),
+                "strict": bool(body.get("strict", True)),
+                "metadata": json_metadata(body.get("metadata", {})),
+                "created_at": datetime.utcnow(),
+                "updated_at": datetime.utcnow(),
+            },
+        )
+        return JSONResponse(content={"status": "created", "policy": policy}, status_code=201)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid product id") from exc
+    finally:
+        await conn.close()
+
+
+@app.patch("/v1/admin/policies/{policy_id}")
+async def admin_update_policy_endpoint(policy_id: str, request: Request):
+    require_keygen_admin(request)
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    values = {}
+    for key in ("name", "scheme"):
+        if key in body:
+            values[key] = str(body.get(key) or "").strip()
+    for key in ("duration", "max_machines", "max_processes", "max_cores"):
+        if key in body:
+            values[key] = int(body.get(key) or 0)
+    if "strict" in body:
+        values["strict"] = bool(body.get("strict"))
+    if "metadata" in body:
+        values["metadata"] = json_metadata(body.get("metadata"))
+    conn = await _admin_db_connect()
+    try:
+        policy = await update_dynamic(conn, "policies", policy_id, KEYGEN_ACCOUNT_ID, values)
+        if not policy:
+            raise HTTPException(status_code=404, detail="Policy not found")
+        return JSONResponse(content={"status": "updated", "policy": policy})
+    finally:
+        await conn.close()
+
+
+@app.delete("/v1/admin/policies/{policy_id}")
+async def admin_delete_policy_endpoint(policy_id: str, request: Request):
+    require_keygen_admin(request)
+    conn = await _admin_db_connect()
+    try:
+        policy_uuid = uuid.UUID(policy_id)
+        license_count = await conn.fetchval("SELECT COUNT(*) FROM licenses WHERE account_id = $1 AND policy_id = $2", KEYGEN_ACCOUNT_ID, policy_uuid)
+        if int(license_count or 0) > 0:
+            raise HTTPException(status_code=409, detail="Policy has licenses and cannot be deleted")
+        result = await conn.execute("DELETE FROM policies WHERE account_id = $1 AND id = $2", KEYGEN_ACCOUNT_ID, policy_uuid)
+        return JSONResponse(content={"status": "deleted", "result": result})
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid policy id") from exc
+    finally:
+        await conn.close()
+
+
 @app.get("/v1/admin/licenses")
 async def admin_list_licenses_endpoint(request: Request, product_id: str = "", policy_id: str = "", limit: int = 50):
     require_keygen_admin(request)
